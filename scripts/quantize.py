@@ -24,12 +24,7 @@ def quantize_file(input_path: Path, output_path: Path, op_types=['MatMul']):
     print(f"Quantizing {input_path.name}...")
     
     # Run shape inference to fix missing types (helps with quantization stability)
-    # We do this on a temporary path or modify the loaded model?
-    # infer_shapes_path modifies/saves to path. Let's use a temp file or just overwrite a temp copy.
-    # Actually, we can use the input file as source for inference, but we shouldn't modify the source FP32 file
-    # if we want to keep it "clean".
-    # Best practice: Load, Infer, Save to temp, then Quantize.
-    
+
     try:
         print(f"  Running shape inference...")
         # Load model
