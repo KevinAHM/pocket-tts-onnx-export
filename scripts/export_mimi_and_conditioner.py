@@ -214,11 +214,13 @@ def patched_mimi_complete_kv(self, k, v, model_state: dict | None):
 MimiStreamingMultiheadAttention._complete_kv = patched_mimi_complete_kv
 
 import os
+from pathlib import Path
 import onnxruntime as ort
 import numpy as np
 from pocket_tts.models.tts_model import TTSModel
-from pocket_tts.default_parameters import DEFAULT_VARIANT
+from pocket_tts.default_parameters import DEFAULT_LANGUAGE
 from pocket_tts.modules.stateful_module import init_states
+from onnx_export.bundle_metadata import write_bundle_metadata
 from onnx_export.export_utils import get_state_structure, flatten_state, unflatten_state
 
 from pocket_tts.modules.conv import StreamingConv1d, StreamingConvTranspose1d
@@ -227,7 +229,8 @@ def patched_conv1d_forward(self, x, model_state: dict | None):
     S = self._stride
     # Removed assert for trace
     if model_state is None:
-        state = self.init_state(B, 0)
+        # Export and inference both use batch size 1, and tracing may present B as a Tensor.
+        state = self.init_state(1, 0)
     else:
         state = self.get_state(model_state)
     TP = state["previous"].shape[-1]
@@ -286,26 +289,26 @@ def patched_get_extra_padding(x, kernel_size, stride, padding_total=0):
     return ideal_length - length
 conv.get_extra_padding_for_conv1d = patched_get_extra_padding
 
-def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.safetensors"):
+def compare_outputs(name, torch_output, onnx_output, exact: bool):
+    if exact:
+        if np.array_equal(torch_output, onnx_output):
+            print(f"{name} matches exactly.")
+            return
+        diff = np.abs(torch_output.astype(np.float64) - onnx_output.astype(np.float64))
+        raise AssertionError(
+            f"{name} mismatch. max_abs_diff={diff.max()} mean_abs_diff={diff.mean()}"
+        )
+
+    np.testing.assert_allclose(torch_output, onnx_output, rtol=2e-5, atol=2e-5)
+    print(f"{name} matches within tolerance.")
+
+
+def export_models(output_dir="onnx_models", language=DEFAULT_LANGUAGE, config=None):
     os.makedirs(output_dir, exist_ok=True)
 
     print("Loading model...")
-    # Load model on CPU
-    tts_model = TTSModel.load_model(DEFAULT_VARIANT)
-
-    # Reload with local voice cloning weights (HF download may have failed)
-    import safetensors.torch
-    if os.path.exists(weights_path):
-        print(f"Reloading weights from {weights_path} (with voice cloning)...")
-        state_dict = safetensors.torch.load_file(weights_path)
-        try:
-            tts_model.load_state_dict(state_dict, strict=True)
-            tts_model.has_voice_cloning = True
-        except Exception as e:
-            print(f"Warning: Failed to load specified weights (strict=True): {e}")
-            print("Using default loaded weights.")
-    else:
-        print(f"Warning: Weights file {weights_path} not found. Using defaults.")
+    tts_model = TTSModel.load_model(language=language, config=config)
+    bundle_name = Path(config).stem if config is not None else language
 
     tts_model.eval()
     
@@ -318,6 +321,7 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
         tts_model.mimi,
         speaker_proj_weight=tts_model.flow_lm.speaker_proj_weight
     )
+    mimi_encoder_wrapper.eval()
     
     # Dummy audio: 1 second at 24kHz
     dummy_audio = torch.randn(1, 1, 24000)
@@ -331,9 +335,9 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
         input_names=["audio"],
         output_names=["latents"],
         dynamic_shapes={"audio": {2: "audio_len"}},
-        opset_version=17,
+        opset_version=18,
         dynamo=True,
-        external_data=False
+        external_data=False,
     )
     print(f"Mimi Encoder exported to {encoder_onnx_path}")
     
@@ -343,6 +347,7 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
     print("Exporting Text Conditioner...")
     
     text_conditioner_wrapper = TextConditionerWrapper(tts_model.flow_lm.conditioner)
+    text_conditioner_wrapper.eval()
     
     # Dummy tokens
     dummy_tokens = torch.randint(0, 1000, (1, 20))
@@ -355,10 +360,10 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
         conditioner_onnx_path,
         input_names=["token_ids"],
         output_names=["embeddings"],
-        dynamic_shapes={"token_ids": {1: "seq_len"}},
-        opset_version=17,
-        dynamo=True,
-        external_data=False
+        dynamic_axes={"token_ids": {1: "seq_len"}},
+        opset_version=14,
+        dynamo=False,
+        external_data=False,
     )
     print(f"Text Conditioner exported to {conditioner_onnx_path}")
     
@@ -376,6 +381,7 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
     mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=STATIC_SEQ_LEN)
     mimi_structure = get_state_structure(mimi_state)
     flat_mimi_state = flatten_state(mimi_state)
+    write_bundle_metadata(output_dir, tts_model, bundle_name=bundle_name, mimi_state=mimi_state)
     
     
     mimi_wrapper = MimiWrapper(
@@ -412,7 +418,7 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
     
     return flow_lm_onnx_path, mimi_onnx_path, tts_model
 
-def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models"):
+def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models", exact=False):
     print("Verifying export...")
     
     encoder_path = os.path.join(output_dir, "mimi_encoder.onnx")
@@ -439,11 +445,7 @@ def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models"):
         # ONNX run
         onnx_encoder_out = ort_encoder.run(None, {"audio": test_audio.numpy()})[0]
         
-        np.testing.assert_allclose(
-            pt_encoder_out.numpy(), onnx_encoder_out, 
-            rtol=1e-4, atol=1e-4
-        )
-        print("Mimi Encoder output matches!")
+        compare_outputs("Mimi Encoder output", pt_encoder_out.numpy(), onnx_encoder_out, exact)
     
     if os.path.exists(conditioner_path):
         # ---------------------------------------------------------
@@ -463,11 +465,7 @@ def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models"):
         # ONNX run
         onnx_conditioner_out = ort_conditioner.run(None, {"token_ids": test_tokens.numpy()})[0]
         
-        np.testing.assert_allclose(
-            pt_conditioner_out.numpy(), onnx_conditioner_out, 
-            rtol=1e-5, atol=1e-5
-        )
-        print("Text Conditioner output matches!")
+        compare_outputs("Text Conditioner output", pt_conditioner_out.numpy(), onnx_conditioner_out, exact)
     
     if mimi_path and os.path.exists(mimi_path):
         # ---------------------------------------------------------
@@ -505,12 +503,10 @@ def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models"):
         onnx_audio = ort_mimi_outs[0]
         onnx_mimi_states = ort_mimi_outs[1:]
         
-        np.testing.assert_allclose(pt_audio, onnx_audio, rtol=1e-4, atol=1e-4)
-        print("Mimi audio output matches!")
+        compare_outputs("Mimi audio output", pt_audio, onnx_audio, exact)
         
         for i, (pt_s, onnx_s) in enumerate(zip(pt_mimi_states, onnx_mimi_states)):
-            np.testing.assert_allclose(pt_s, onnx_s, rtol=1e-4, atol=1e-4)
-        print("Mimi states match!")
+            compare_outputs(f"Mimi state {i}", pt_s, onnx_s, exact)
         
         print("Verification successful!")
 
@@ -518,11 +514,13 @@ def main():
     torch.manual_seed(42)
     parser = argparse.ArgumentParser(description="Export Mimi and Conditioner models to ONNX.")
     parser.add_argument("--output_dir", "-o", type=str, default="onnx_models", help="Directory for output ONNX files")
-    parser.add_argument("--weights_path", "-w", type=str, default="weights/tts_b6369a24.safetensors", help="Path to weights file")
+    parser.add_argument("--language", type=str, default=DEFAULT_LANGUAGE, help="Model language/config name.")
+    parser.add_argument("--config", type=str, default=None, help="Path to a local YAML config file.")
+    parser.add_argument("--exact", action="store_true", help="Require exact torch vs ONNX equality.")
     args = parser.parse_args()
     
-    flow, mimi, model = export_models(output_dir=args.output_dir, weights_path=args.weights_path)
-    verify_export(flow, mimi, model, output_dir=args.output_dir)
+    flow, mimi, model = export_models(output_dir=args.output_dir, language=args.language, config=args.config)
+    verify_export(flow, mimi, model, output_dir=args.output_dir, exact=args.exact)
 
 if __name__ == "__main__":
     main()

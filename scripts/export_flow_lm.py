@@ -4,12 +4,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
+from pathlib import Path
 import onnx
+import onnxruntime as ort
+import numpy as np
 from pocket_tts.models.tts_model import TTSModel
-from pocket_tts.default_parameters import DEFAULT_VARIANT
+from pocket_tts.default_parameters import DEFAULT_LANGUAGE
 from pocket_tts.modules.stateful_module import init_states, StatefulModule
 from pocket_tts.modules.transformer import StreamingMultiheadAttention
 from pocket_tts.modules.mimi_transformer import MimiStreamingMultiheadAttention, KVCacheResult
+from onnx_export.bundle_metadata import write_bundle_metadata
 from onnx_export.export_utils import get_state_structure, flatten_state
 
 # ==============================================================================
@@ -185,6 +189,62 @@ class FlowNetWrapper(nn.Module):
         return self.flow_net(c, s, t, x)
 
 
+def compare_outputs(name, torch_output, onnx_output, exact: bool):
+    if exact:
+        if np.array_equal(torch_output, onnx_output):
+            print(f"{name} matches exactly.")
+            return
+        diff = np.abs(torch_output.astype(np.float64) - onnx_output.astype(np.float64))
+        raise AssertionError(
+            f"{name} mismatch. max_abs_diff={diff.max()} mean_abs_diff={diff.mean()}"
+        )
+
+    np.testing.assert_allclose(torch_output, onnx_output, rtol=2e-5, atol=2e-5)
+    print(f"{name} matches within tolerance.")
+
+
+def verify_export(tts, structure, flat_state, main_out_path, flow_out_path, exact: bool):
+    print("\nVerifying FlowLM exports...")
+    ort_main = ort.InferenceSession(main_out_path)
+    ort_flow = ort.InferenceSession(flow_out_path)
+
+    main_wrapper = FlowLMMainWrapper(tts.flow_lm, structure)
+    flow_wrapper = FlowNetWrapper(tts.flow_lm)
+
+    test_seq = torch.randn(1, 1, tts.flow_lm.ldim)
+    test_text = torch.randn(1, 3, tts.flow_lm.dim)
+
+    with torch.no_grad():
+        pt_main = main_wrapper(test_seq, test_text, flat_state)
+
+    ort_inputs = {
+        "sequence": test_seq.numpy(),
+        "text_embeddings": test_text.numpy(),
+    }
+    for i, state_tensor in enumerate(flat_state):
+        ort_inputs[f"state_{i}"] = state_tensor.numpy()
+    onnx_main = ort_main.run(None, ort_inputs)
+
+    compare_outputs("FlowLM conditioning", pt_main[0].numpy(), onnx_main[0], exact)
+    compare_outputs("FlowLM eos_logit", pt_main[1].numpy(), onnx_main[1], exact)
+    for i, (pt_state, onnx_state) in enumerate(zip(pt_main[2:], onnx_main[2:])):
+        compare_outputs(f"FlowLM state {i}", pt_state.numpy(), onnx_state, exact)
+
+    test_c = torch.randn(1, tts.flow_lm.dim)
+    test_s = torch.tensor([[0.0]], dtype=torch.float32)
+    test_t = torch.tensor([[1.0]], dtype=torch.float32)
+    test_x = torch.randn(1, tts.flow_lm.ldim)
+
+    with torch.no_grad():
+        pt_flow = flow_wrapper(test_c, test_s, test_t, test_x)
+    onnx_flow = ort_flow.run(
+        None,
+        {"c": test_c.numpy(), "s": test_s.numpy(), "t": test_t.numpy(), "x": test_x.numpy()},
+    )[0]
+    compare_outputs("Flow net output", pt_flow.numpy(), onnx_flow, exact)
+    print("FlowLM verification successful.")
+
+
 # ==============================================================================
 # 3. EXPORT SCRIPT
 # ==============================================================================
@@ -193,31 +253,23 @@ def main():
     torch.manual_seed(42)
     parser = argparse.ArgumentParser(description="Export FlowLM models to ONNX.")
     parser.add_argument("--output_dir", "-o", type=str, default="onnx_models", help="Directory for output ONNX files")
-    parser.add_argument("--weights_path", "-w", type=str, default="weights/tts_b6369a24.safetensors", help="Path to weights file used to load FlowLM")
+    parser.add_argument("--language", type=str, default=DEFAULT_LANGUAGE, help="Model language/config name.")
+    parser.add_argument("--config", type=str, default=None, help="Path to a local YAML config file.")
+    parser.add_argument("--exact", action="store_true", help="Require exact torch vs ONNX equality.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("Loading model...")
-    tts = TTSModel.load_model(DEFAULT_VARIANT).cpu().eval()
-    
-    # Reload weights if available to match production
-    if os.path.exists(args.weights_path):
-        import safetensors.torch
-        print(f"Reloading weights from {args.weights_path}...")
-        state_dict = safetensors.torch.load_file(args.weights_path)
-        # Load only common keys or strict if possible; strict might fail if keys missing in state dict
-        # Assuming safe load for now or rely on load_model matching the weights
-        try:
-            tts.load_state_dict(state_dict, strict=False)
-        except Exception as e:
-            print(f"Warning: Failed to reload specified weights: {e}")
+    tts = TTSModel.load_model(language=args.language, config=args.config).cpu().eval()
+    bundle_name = Path(args.config).stem if args.config is not None else args.language
             
     # Init patched state
     STATIC_SEQ_LEN = 1000
     state = init_states(tts.flow_lm, batch_size=1, sequence_length=STATIC_SEQ_LEN)
     structure = get_state_structure(state)
     flat_state = flatten_state(state)
+    write_bundle_metadata(args.output_dir, tts, bundle_name=bundle_name, flow_state=state)
     
     state_input_names = [f"state_{i}" for i in range(len(flat_state))]
     state_output_names = [f"out_state_{i}" for i in range(len(flat_state))]
@@ -262,6 +314,7 @@ def main():
         opset_version=14, dynamo=False
     )
     print(f"Exported {flow_out_path}")
+    verify_export(tts, structure, flat_state, main_out_path, flow_out_path, exact=args.exact)
     print("\nDone! 2-Model split optimization complete.")
 
 if __name__ == "__main__":

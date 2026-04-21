@@ -1,58 +1,174 @@
 # PocketTTS ONNX Export
 
-This package provides a robust pipeline to export **PocketTTS** models to ONNX (FP32 and INT8), optimized for streaming inference on diverse runtimes (Web, Edge, CPU).
+This repo exports gated [Kyutai Pocket TTS](https://huggingface.co/kyutai/pocket-tts) checkpoints to ONNX and writes bundle outputs directly into the sibling `pocket-tts-onnx` runtime repo.
+
+Published exported weights and inference code:
+
+- [KevinAHM/pocket-tts-onnx](https://huggingface.co/KevinAHM/pocket-tts-onnx)
+
+It currently targets:
+
+- `english_2026-04`
+- `french_24l`
+- `german`
+- `german_24l`
+- `italian`
+- `italian_24l`
+- `portuguese`
+- `portuguese_24l`
+- `spanish`
+- `spanish_24l`
+
+## What It Produces
+
+For each language bundle, the exporter writes:
+
+- `bundle.json`
+- `tokenizer.model`
+- `bos_before_voice.npy`
+- `flow_lm_main.onnx`
+- `flow_lm_flow.onnx`
+- `mimi_decoder.onnx`
+- `mimi_encoder.onnx`
+- `text_conditioner.onnx`
+
+If quantization is enabled, it also writes:
+
+- `flow_lm_main_int8.onnx`
+- `flow_lm_flow_int8.onnx`
+- `mimi_decoder_int8.onnx`
+- `mimi_encoder_int8.onnx`
+- `text_conditioner_int8.onnx`
+
+Output goes to:
+
+```text
+pocket-tts-onnx/onnx/<language>/
+```
 
 ## Usage
 
-1.  **Install Dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
+1. Install dependencies:
 
-2.  **Run Export**:
-    ```bash
-    # Exports FP32 models to ./onnx
-    python export.py
+```bash
+sfw pip install -r requirements.txt
+```
 
-    # Exports FP32 AND INT8 models (recommended)
-    python export.py --quantize
-    ```
+2. Export one bundle:
 
-## Output Artifacts
+```bash
+python export.py --language english_2026-04
+```
 
-The pipeline generates **5 distinct ONNX models** in the `onnx/` directory:
+3. Export one bundle and quantize in place:
 
-| Model | Description | Reasoning |
-| :--- | :--- | :--- |
-| **`text_conditioner.onnx`** | Tokenizer → Embeddings | Lightweight text processing only. |
-| **`mimi_encoder.onnx`** | Audio → Latents | Used for voice cloning (reference audio encoding). |
-| **`flow_lm_main.onnx`** | Transformer Backbone | **Stateful AR**. Updates KV-cache and steps. Returns conditioning vector. |
-| **`flow_lm_flow.onnx`** | Flow Matching Net | **Stateless**. Solves the ODE step ($v = f(x, t, c)$). |
-| **`mimi_decoder.onnx`** | Latents → Audio | Streaming neural codec decoder. |
+```bash
+python export.py --language english_2026-04 --quantize
+```
 
-## Technical Implementation
+4. Export from a local config file instead of a named language:
 
-### 1. Split-Architecture for FlowLM
-Unlike the unified PyTorch model, we split the **Flow Transformer** into two parts (`main` and `flow`):
-*   **Why?** The Flow Matching process involves a loop (ODE solver) that runs multiple times (e.g., 10 steps). Exporting this as a fixed graph forces extreme determinism, preventing noise injection.
-*   **Result**: By splitting `main` (backbone) and `flow` (solver step), we move the control loop to the **Runtime (Python/JS)**. This allows us to:
-    1.  **Inject Temperature**: Add noise at each solver step, which is **critical** for breaking deterministic loops and ensuring the model correctly fires the **EOS (End of Sentence)** token.
-    2.  **Adjust Quality**: Change the number of LSD steps dynamically without re-exporting.
+```bash
+python export.py --config /path/to/model.yaml
+```
 
-### 2. Monkeypatching for Export
-The original PyTorch code uses stateful modules (e.g., `StreamingMultiheadAttention`) that manage their own buffers. ONNX requires explicit state passing (Inputs $\rightarrow$ Outputs).
-*   **Strategy**: We "monkeypatch" these classes during export to expose their internal caches (KV-cache, counters) as distinct **Input/Output** graph nodes. This makes the models purely functional and side-effect free, which is essential for `onnxruntime`.
+5. Run strict verification during export:
 
-### 3. Safe Quantization
-We use **Dynamic Quantization** targeting `MatMul` (Matrix Multiplication) operators only.
-*   **Why?** This ensures broad compatibility (e.g., older CPUs, WebAssembly) and avoids issues with specific operators (like `ConvInteger`) that can be problematic or slow on certain execution providers. It reduces model size by ~70% with negligible quality loss.
+```bash
+python export.py --language english_2026-04 --exact
+```
 
-## Credits & License
+## Export Flow
 
-This project includes code from **[PocketTTS](https://github.com/kyutai-labs/pocket-tts)** by **Kyutai Labs**.
+`export.py` is the entry point. It runs:
 
-*   **Original Code License**: MIT
-*   **Modifications**: This exporter package modifies the original source to support ONNX tracing (via monkeypatching and wrappers) and splits the architecture for improved runtime control.
+1. `scripts/export_mimi_and_conditioner.py`
+2. `scripts/export_flow_lm.py`
+3. `scripts/quantize.py` if `--quantize` is enabled
 
-Code from the `pocket_tts` module is redistributed here under the terms of the MIT License.
+The exporter also writes bundle metadata used by the `pocket-tts-onnx` runtime:
 
+- tokenizer filename
+- state manifests for FlowLM and Mimi
+- sample/frame metadata
+- BOS-before-voice tensor path
+- preprocessing flags such as `remove_semicolons`
+
+## Implementation Notes
+
+### Split FlowLM
+
+FlowLM is exported as two graphs:
+
+- `flow_lm_main`: transformer backbone plus state updates
+- `flow_lm_flow`: stateless flow-matching step
+
+This keeps the LSD loop in the runtime and allows dynamic step counts and temperature control.
+
+### Explicit Stateful I/O
+
+Pocket TTS uses stateful streaming modules internally. During export, those modules are patched so their caches and counters become explicit ONNX inputs and outputs.
+
+### Voice Cloning Support
+
+The bundle format preserves the v2 voice-cloning path:
+
+- `mimi_encoder.onnx` encodes reference audio
+- `bos_before_voice.npy` is exported for models that prepend a learned BOS-before-voice embedding
+- bundle metadata records the state layout needed by the runtime
+
+### Quantization
+
+Quantization uses `onnxruntime.quantization.quantize_dynamic` and targets `MatMul` operators. This is the safe CPU-oriented path used by this repo.
+
+## Repo Layout
+
+```text
+pocket-tts-onnx-export/
+├── export.py
+├── onnx_export/
+│   ├── bundle_metadata.py
+│   ├── export_utils.py
+│   └── wrappers.py
+├── pocket_tts/
+├── scripts/
+│   ├── export_flow_lm.py
+│   ├── export_mimi_and_conditioner.py
+│   └── quantize.py
+├── pocket-tts-onnx/
+│   └── onnx/
+└── requirements.txt
+```
+
+## Requirements
+
+Install from:
+
+```bash
+sfw pip install -r requirements.txt
+```
+
+Main packages:
+
+- `torch`
+- `onnx`
+- `onnxruntime`
+- `huggingface_hub`
+- `safetensors`
+- `sentencepiece`
+- `scipy`
+
+## Source Model
+
+This exporter is wired for the gated voice-cloning repo:
+
+- `kyutai/pocket-tts`
+
+It does not target the older no-voice-cloning release.
+
+## License
+
+This repo includes modified code derived from [kyutai-labs/pocket-tts](https://github.com/kyutai-labs/pocket-tts).
+
+- Original Pocket TTS code: MIT
+- Export/runtime bundle artifacts: subject to the upstream model and dataset terms from Kyutai / Hugging Face
